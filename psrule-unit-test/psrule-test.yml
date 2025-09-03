@@ -1,0 +1,169 @@
+name: Module_Unit_Test_psrule
+
+pool: abt-provisoner-service-work-agents
+
+parameters:
+
+- name: Show
+  displayName: "Show Detail or Summary?"
+  default: Summary
+  values:
+   - Summary
+   - Detail
+- name: FilterResults
+  displayName: "Show Success and/or Fail?"
+  default: All
+  values:
+   - Pass
+   - Fail
+   - Processed
+   - All
+
+variables:
+  - group: unit-testing-loganalytics
+  - name: configPath
+    value: '$(Build.SourcesDirectory)/azure-pipelines/unit-test/.ps-rule'
+  - name: configFile
+    value: '$(Build.SourcesDirectory)/azure-pipelines/unit-test/.ps-rule/ps-rule.yaml'
+  - name: environment
+    value: 'work'
+  - name: serviceConnection
+    value: 'abt-devops-agents-work-sp'
+  
+resources:
+  repositories:
+    - repository: azdo-yaml-templates #alias name
+      type: git #type of repository
+      name: azdo-yaml-templates #repository name
+      ref: feature/unit-test #feature/infra-gen-kp #'refs/heads/main' #git branch reference
+      # TODO once template is merged to main remove feature branch here
+
+stages: 
+- stage: Running_Module_Test
+  displayName: "Run_Module_unit_test"
+  jobs:
+  - job: runModuleUnitTesting
+    displayName: running_module_unit_testing
+    steps:
+      - checkout: self
+      - task: PowerShell@2
+        displayName: 'Execute JSON Config PowerShell Script'
+        inputs:
+         targetType: 'inline'
+         script: |
+           Copy-Item -Path '$(Build.SourcesDirectory)/bicep-config-files/bicepconfig.json.$(environment)' -Destination '$(Build.SourcesDirectory)/bicepconfig.json' -Force
+           Copy-Item -Path '$(Build.SourcesDirectory)/bicep-config-files/bicepconfig.json.$(environment)' -Destination '$(Build.SourcesDirectory)/azure-resources/bicepconfig.json' -force
+           Get-Content -Path '$(Build.SourcesDirectory)/bicepconfig.json'
+      # - template: templates/bicep-pwsh.yml@azdo-yaml-templates     
+      - template: templates/psrule-unit-test.yml@azdo-yaml-templates
+
+      - task: AzureCLI@2
+        displayName: 'Run PSRule on Bicep files'
+        continueOnError: true
+        inputs:
+         azureSubscription: $(serviceConnection)  # Add your service connection name
+         scriptType: 'pscore'
+         scriptLocation: 'inlineScript'
+         inlineScript: |
+          Write-Host "Validating all Bicep files with PSRule..."
+          # Define paths
+          $rootDirectory = "$(Build.SourcesDirectory)/params/"
+          # Get all of the module folders
+          $excludeFolders = @('container-app', 'container-managedcluster', 'virtual-machine')
+          $folders = Get-ChildItem -Directory -Path "$rootDirectory" -Depth 1 -Exclude $excludeFolders
+          Write-Host "Sub directory of resource list  $folders"
+          # Loop through all of the bicep modules
+          foreach ($folder in $folders) {
+            Write-Host "Sub Module: $folder"
+          }
+          # Debugging: Output the number of Bicep files found
+          Write-Host 'Found' $folders.Count 'Bicep files.'
+          if ($folders.Count -eq 0) {
+            Write-Host "No Bicep files found in repository."
+            exit 1
+          }  
+          # Loop through each Bicep file and validate it
+          foreach ($folder in $folders) {
+            $bicepParamsFile = "$($folder.FullName)/main.bicepparam"
+            $folderName = $folder.Name
+            # Create a directory to store PSRule results
+            $outputDirectory = "$(Build.ArtifactStagingDirectory)/psrule-results/$folderName"
+            New-Item -ItemType Directory -Force -Path $outputDirectory  
+            Write-Host "checking param file $bicepParamsFile"
+            if (Test-Path $bicepParamsFile) {
+              Write-Host "Running PSRule for $bicepParamsFile"
+              $tags = "param tags = {`n  applicationEnvironment: 'dev1'`n  hostingEnvironment: 'nonp'`n  'deployable-asset': 'f1ce3d49-b459-4631-bc3a-ecffdaebba08'`n}"
+              # Read the content of the Bicep Param file
+              $bicepParamContent = Get-Content $bicepParamsFile -Raw
+              if ($bicepParamContent -match "param\s+tags\s*=") {
+                $bicepParamContent = $bicepParamContent -replace 'param\s+tags\s*=\s*{[^}]*}', "param tags = {`n  applicationEnvironment: 'dev1'`n  hostingEnvironment: 'nonp'`n  'deployable-asset': 'f1ce3d49-b459-4631-bc3a-ecffdaebba08'`n}"
+              } else {
+                $bicepParamContent += "`nparam tags = {`n  applicationEnvironment: 'dev1'`n  hostingEnvironment: 'nonp'`n  'deployable-asset': 'f1ce3d49-b459-4631-bc3a-ecffdaebba08'`n}`n"
+              }
+              # Save the modified content back to the Bicep Param file
+              $bicepParamContent | Set-Content $bicepParamsFile
+              $bicepParamContent = Get-Content $bicepParamsFile -Raw
+              # Write-Host $bicepParamContent
+              Write-Host "Tags have been successfully added/updated in the Bicep Param file."
+              $outputFile = "$outputDirectory/psrule_results.txt"
+              write-Host "invoke with results"
+              $results = Invoke-PSRule -InputPath $bicepParamsFile -Module 'PSRule.Rules.Azure' -Option $(configFile)  -As 'Summary'  -ErrorAction Continue    
+              $ruleOutcome = $results | Format-Table | Out-String  
+              # Save the outcome to a text file in the ArtifactStagingDirectory
+              $ruleOutcome | Set-Content -Path $outputFile
+              write-Host 'the PSRULE outcomes are:' $ruleOutcome
+              Write-Host "Generating SARIF Report for $folderName"
+              # Define SARIF output path
+              $sarifOutputPath = "$(Build.ArtifactStagingDirectory)/sarif-output/$folderName/psrule_results.sarif"
+              # Ensure the directory exists for SARIF output
+              New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)/sarif-output/$folderName"
+              # Run SARIF report conversion
+              & "$(Build.SourcesDirectory)/azure-pipelines/unit-test/sarifreport.ps1" -InputPath $outputFile -OutputPath $sarifOutputPath
+              Write-Host "##vso[task.setvariable variable=folderName]$folderName"
+            } else {
+              Write-Host "No main.bicepparams found in $($folder.Name), skipping..."
+            }
+          }
+            # Set an Azure DevOps variable for use in the next task
+            Write-Host "##vso[task.setvariable variable=Resultsoutput;]$ruleOutcome"
+            Write-Host "##vso[task.setvariable variable=Resultsoutput;]$outputFile"
+            write-Host 'the outcome file is:'$outputFile
+            Write-Host "##vso[task.setvariable variable=Sarifoutput;]$outputDirectory"
+            Write-Host "PSrule validation completed"
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish PSRule Results and SARIF Reports'
+        inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)/psrule-results'  # Path to each folder's PSRule results
+            ArtifactName: 'psrule-results'  # Unique artifact name for each resource
+            publishLocation: 'Container'
+
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish SARIF Results'
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)/sarif-output'  # Path to each folder's SARIF output
+          ArtifactName: 'sarif-output-reports'  # Unique artifact name for each resource
+          publishLocation: 'Container'  
+
+      - script: |
+              echo "Listing files in the artifact directory"
+              ls -R $(Build.ArtifactStagingDirectory)/psrule-results
+              ls -R $(Build.ArtifactStagingDirectory)/sarif-output
+        displayName: 'List Artifact Files' 
+      
+      - task: DownloadBuildArtifacts@0
+        displayName: 'Download SARIF Artifact'
+        inputs:
+          buildType: 'current'
+          artifactName: 'sarif-output-reports'  # Name of the artifact to download
+          downloadPath: '$(Build.ArtifactStagingDirectory)/sarif-output'  # Path where the artifact will be downloaded
+
+     #TODO LOG analytics 
+      - task: PowerShell@2
+        displayName: 'Send SARIF Outcome to Log Analytics'
+        inputs:
+            targetType: 'filePath'  # This tells Azure DevOps to run the script from a file.
+            filePath: '$(Build.SourcesDirectory)/azure-pipelines/unit-test/SarifToLogAnalytics.ps1'  # Provide the path to your .ps1 script file
+            arguments: '-workspaceId $(MONITOR_WORKSPACE_ID) -workspaceKey $(MONITOR_WORKSPACE_KEY) -sarifFolderPath "$(Build.ArtifactStagingDirectory)/sarif-output/sarif-output-reports"' # Optional: Add any parameters to your script here
+            failOnStderr: true  # Fail if there is any error in stderr
+            pwsh: true  # To run the script in PowerShell Core (optional)  
+
