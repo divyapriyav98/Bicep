@@ -1,0 +1,13 @@
+image:
+    repository: acrworkeastusurkvf.azurecr.io/external-secrets/external-secrets
+    tag: v0.9.20
+
+webhook:
+    image:
+        repository: acrworkeastusurkvf.azurecr.io/external-secrets/external-secrets
+        tag: v0.9.20
+
+certController:
+    image:
+        repository: acrworkeastusurkvf.azurecr.io/external-secrets/external-secrets
+        tag: v0.9.20
