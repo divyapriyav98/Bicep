@@ -1,0 +1,240 @@
+trigger: none
+pr: none
+
+name: Provision_$(System.DefinitionId)_$(Build.BuildId)_Azure
+
+parameters:
+- name: serviceSpecification
+  type: object
+  default: 
+    {
+                "type": "container-managedcluster@v0.0.1",
+                "osb": {
+                    "keyVaultUrl": "https://osb-azureo-psifc-Appkv.vault.azure.net/",
+                    "subscriptionId": "b172cc90-dfdb-4b83-860d-52fdc1dfba29",
+                    "resourceGroup": "keyvaults-osb-azure-osb-nonp-stg-eastus"
+                },
+                "provisioningTarget": {
+              "subscriptionId": "7c7ae4d3-7431-473f-bc70-b13f275037b9" ###using MSFT sub for testing "8faead62-8222-4492-a374-e5812a27de08",
+                },
+                "parameters": {
+                    "size": "small",
+                    "minAutoScale": 3,
+                    "maxAutoScale": 8,
+                    "appName": "a2",
+                    "location": "eastus", #this was missing from OSB inputs
+                    "region": "eastus",
+                    "tierName": "nonp",
+                    "environment": "nonp",
+                    "appNameSanitized": "appNameSanitized01",
+                    "shortTierName": "shortTierName01",
+                    "shortAppName": "shortAppName01",
+                    "shortEnvironmentName": "shortEnvironmentName01"           
+                },
+                "metadata": {
+                    "platform": "AZURE",
+                    "hostingEnvironment": "NON-PROD",
+                    "environment": "NON-PROD",
+                    "applicationEnvironment": "nonp",
+                    "region": "us-east",
+                    "assetuuid": "8e2e15a4-dcca-4d74-9841-7eb6f337cbe7",
+                    "deployable-asset-name": "Magic Hat DA Name",
+                    "deployable-asset": "dababf65-e0f2-469d-be83-90d629d0107d",
+                    "technical-asset-name": "Magic Hat",
+                    "technical-asset": "8e2e15a4-dcca-4d74-9841-7eb6f337cbe7",
+                    "product-name": "Making magic",
+                    "product": "85480a8e-7fc4-45e5-be2f-4dbc22ffdf44",
+                    "program-name": "WOO - Wizard of Oz",
+                    "program": "e78a8460-c043-4cad-955b-1961d0823870",
+                    "publicIP": "AKS"
+                }
+    }
+  displayName: 'serviceSpecification'
+
+variables:
+- group: nonp-AKSPostProvisioning
+- name: azure_svc_connection
+  value: 'abt-devops-agents-nonp-sp'
+- name: osbOutputSecretName
+  value: 'az-$(System.DefinitionId)-$(Build.BuildId)'
+ 
+pool: 'abt-provisoner-service-nonp-agents'
+
+resources:
+  repositories:
+    - repository: azdo-yaml-templates #alias name
+      type: git #type of repository
+      name: azdo-yaml-templates #repository name
+      # ref: feature/infra-gen-kp #'refs/heads/main' #git branch reference
+
+stages:
+  - stage: OSBpreprocessing
+    displayName: OSB Processing
+    jobs:
+
+    - template: templates/prereq-check-osb-prepare.yml@azdo-yaml-templates
+      parameters: 
+        osbManifest: ${{ parameters.serviceSpecification }}
+        osbOutputSecretName: $(osbOutputSecretName)
+            
+
+  - stage: Provisioning
+    displayName: Linting and Provisioning Azure Resources
+    dependsOn: OSBpreprocessing
+    variables:
+      location: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.location'] ]
+      az_resource_name: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.az_resource_name'] ]
+      subscriptionId: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.subscriptionId'] ]
+      bicepParamFile: '$(Build.SourcesDirectory)/params/$(az_resource_name)/main.bicepparam'
+      templateFile: '$(Build.SourcesDirectory)/azure-resources/$(az_resource_name)/main.bicep'
+      environment: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.environment'] ]
+      appName: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.appName'] ]
+      deploymentName: '$(Build.BuildId)-Deploy_Azure_Infra-$(System.DefinitionId)'
+
+    jobs:
+      - job: LintingValidateAndProvisioning
+        steps:
+        - template: templates/bicep-config-env-file.yml@azdo-yaml-templates
+        - template: templates/bicep-lint-file.yml@azdo-yaml-templates
+        - template: templates/bicep-validate-what-if.yml@azdo-yaml-templates
+          parameters:
+            location: $(location)
+            az_resource_name: $(az_resource_name)
+        - template: templates/bicep-deploy.yml@azdo-yaml-templates
+          parameters:
+            location: $(location)
+            az_resource_name: $(az_resource_name)
+            # custom script ----------------------------------------
+
+        - task: AzureCLI@2
+          name: FetchBicepOutputs
+          displayName: "Fetch Bicep Outputs from Deployment"
+          #condition: and(succeeded(), contains('${{ parameters.serviceSpecification.type }}', 'virtual-machine-scaleset'))
+          inputs:
+            azureSubscription: '$(azure_svc_connection)' 
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            inlineScript: |
+              set -euo pipefail
+              echo "subscriptionId: $(subscriptionId)"
+              echo "deploymentname: $(deploymentName)"
+              # Ensure correct subscription context
+              az account set --subscription "$(subscriptionId)" 
+              # DEPLOYMENT_NAME="27110-Deploy_Azure_Infra-31" 
+              # DEPLOYMENT_NAME="$deploymentName" 
+              # OUTPUT=$(az deployment sub show \
+              #   --name "29318-Deploy_Azure_Infra-49" \
+              #   --query properties.outputs \
+              #   --output json)  
+              OUTPUT=$(az deployment sub show \
+                --name "$(deploymentName)" \
+                --query properties.outputs \
+                --output json)
+              echo "Bicep Outputs:"
+              echo "$OUTPUT" 
+              UMI_PRINCIPALID=$(echo "$OUTPUT" | jq -r '.umiprincipalId.value') 
+              ResourceGroupName=$(echo "$OUTPUT" | jq -r '.resourceGroupName.value')
+              UMI_ClientID=$(echo "$OUTPUT" | jq -r '.umI_ClientID.value')
+              if [[ -z "$UMI_PRINCIPALID" || "$UMI_PRINCIPALID" == "null" ]]; then
+                 echo "ERROR: Could not extract 'umiprincipalId' from deployment output"
+                 exit 1
+              fi 
+              echo "Setting UMI_PRINCIPALID=$UMI_PRINCIPALID"
+              echo "Setting ResourceGroupName=$ResourceGroupName"
+              echo "Setting UMI_ClientID=$UMI_ClientID"
+              echo "##vso[task.setvariable variable=umiPrincipalId;isOutput=true]$UMI_PRINCIPALID"
+              echo "##vso[task.setvariable variable=ResourceGroupName;isOutput=true]$ResourceGroupName"
+              echo "##vso[task.setvariable variable=UMI_ClientID;isOutput=true]$UMI_ClientID"
+               
+        - task: AzureCLI@2
+          displayName: 'Execute Deployment Custom Script'
+          condition: and(succeeded(), contains('${{ parameters.serviceSpecification.type }}', 'virtual-machine-scaleset'))
+          inputs:
+            azureSubscription: '$(azure_svc_connection)' 
+            scriptType: 'pscore'  # <-- this is the key for PowerShell Core support
+            scriptLocation: 'scriptPath'
+            scriptPath: '$(Build.SourcesDirectory)/azure-resources/virtual-machine-scaleset/scripts/customdeploy.ps1'
+            addSpnToEnvironment: true
+            arguments: "-resourceGroup $(FetchBicepOutputs.ResourceGroupName)" #new
+          env:
+              SUBSCRIPTION_ID: $(subscriptionId) #'bd341354-d4c1-4de2-996f-6228b587337c'
+              ARTIFACT_URLS: 'https://artifacts.eastus.az.mastercard.int/artifactory/archive-unstable/com/mastercard/claas/terraform/utils/simple-healthcheck-server-0.0.6,https://artifacts.eastus.az.mastercard.int/artifactory/archive-unstable/com/mastercard/claas/terraform/utils/simple-healthcheck-server-start-script-0.0.6'
+              ARTIFACT_NAME: 'simple-healthcheck-server-0.0.6'
+              SERVICEBOOTSTRAPNAME: '$(Build.SourcesDirectory)/azure-resources/virtual-machine-scaleset/scripts/service-bootstrap.sh'
+
+        - task: AzureCLI@2
+          displayName: "Deploy Custom Script Extension to VMSS"
+          inputs:
+            azureSubscription: '$(azure_svc_connection)'
+            scriptType: 'pscore'
+            scriptLocation: "scriptPath"
+            scriptPath: '$(Build.SourcesDirectory)/azure-resources/virtual-machine-scaleset/scripts/deployscript.ps1'
+            arguments: "-subscriptionId $(subscriptionId) -resourceGroup $(FetchBicepOutputs.ResourceGroupName) -umiclientid $(FetchBicepOutputs.UMI_ClientID)" 
+           # custom script ends -------------------------------------- 
+  
+  - stage: PostgresHotfix # TODO: This is a hotfix until an permenant solution is found - https://github.com/Azure/bicep-types-az/issues/2261
+    displayName: Disabling Postgres Public Access
+    dependsOn: 
+    - OSBpreprocessing
+    - Provisioning
+    variables:
+      location: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.location'] ]
+      appName: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.appName'] ]
+      subscriptionId: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.subscriptionId'] ]
+      applicationEnvironment: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.applicationEnvironment'] ]
+      hostingEnvironment: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.hostingEnvironment'] ]
+      shortEnvironmentName: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.shortEnvironmentName'] ]
+    condition: and(succeeded(), eq('${{ parameters.serviceSpecification.type }}', 'postgres@v0.0.1'))
+    jobs:
+    - job: DisablePostgresPublicAccess
+      steps:
+      - template: ./hotfixes/postgres-pub-access-hotfix.yml  
+
+  - stage: PostAKSValidationCheck
+    dependsOn:
+    - Provisioning
+    - OSBpreprocessing
+    variables:
+      - group: nonp-AKSPostProvisioning
+      - name: location
+        value: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.location'] ]
+      - name: az_resource_name
+        value: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.az_resource_name'] ]
+      - name: appName
+        value: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.appName'] ]
+      - name: environment
+        value: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.environment'] ]
+      - name: subscriptionId
+        value: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.subscriptionId'] ]
+      - name: tierName
+        value: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.tierName'] ]
+      - name: applicationEnvironment
+        value: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.applicationEnvironment'] ]
+      - name: hostingEnvironment
+        value: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.hostingEnvironment'] ]
+      - name: shortTierName
+        value: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.shortTierName'] ]
+      
+    condition: and(succeeded(), eq('${{ parameters.serviceSpecification.type }}', 'container-managedcluster@v0.0.1'))
+    jobs:
+    - template: templates/aks-post-provision.yml@azdo-yaml-templates
+
+  - stage: ContainerAppPostProvisioning
+    dependsOn:
+    - Provisioning
+    - OSBpreprocessing
+    variables:
+      location: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.location'] ]
+      az_resource_name: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.az_resource_name'] ]
+      appName: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.appName'] ]
+      environment: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.environment'] ]
+      subscriptionId: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.subscriptionId'] ]
+      tierName: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.tierName'] ]
+      size: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.size'] ]
+      applicationEnvironment: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.applicationEnvironment'] ]
+      hostingEnvironment: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.hostingEnvironment'] ]
+      shortTierName: $[ stageDependencies.OSBpreprocessing.DeserializeManifest.outputs['DeserializeOSB.shortTierName'] ]
+
+    condition: and(succeeded(), eq('${{ parameters.serviceSpecification.type }}', 'container-app@v0.0.1'))
+    jobs:
+    - template: templates/aks-container-app.yml@azdo-yaml-templates
