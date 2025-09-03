@@ -1,0 +1,10 @@
+# YAML: Enable expansion for Bicep source files.
+configuration:
+  # Enable automatic expansion of Azure parameter files.
+  AZURE_PARAMETER_FILE_EXPANSION: true
+  # Enable automatic expansion of Azure Bicep source files.
+  AZURE_BICEP_FILE_EXPANSION: true
+  AZURE_BICEP_PARAMS_FILE_EXPANSION: true
+  AZURE_BICEP_FILE_EXPANSION_TIMEOUT: 119
+  PSRULE_AZURE_BICEP_USE_AZURE_CLI: true
+
